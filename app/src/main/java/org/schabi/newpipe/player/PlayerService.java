@@ -196,19 +196,24 @@ public final class PlayerService extends MediaBrowserServiceCompat {
 
     //region Podcast widget
     /**
-     * Handles a home-screen podcast widget control. When the player already has a play queue, the
-     * action controls it (leaving a video/popup player type alone); otherwise the last recorded
-     * queue is resumed as background audio playback. The player is always non-null here, since
-     * widget intents carry {@link #SHOULD_START_FOREGROUND_EXTRA}.
+     * Handles a home-screen podcast widget control. The stored queue is loaded first: when the
+     * live queue is the stored one (or nothing was ever recorded), the action controls the live
+     * player (leaving a video/popup player type alone); otherwise - no live queue, or an
+     * unrelated one such as a single other video - the stored queue is resumed as background
+     * audio playback. The player is always non-null here and the service is already in the
+     * foreground, since widget intents carry {@link #SHOULD_START_FOREGROUND_EXTRA}.
      *
      * @param intent the widget intent, carrying the widget action and possibly a queue index
      * @param action the widget action (one of the {@code ACTION_*} contract constants)
      */
     private void handlePodcastWidgetAction(@NonNull final Intent intent,
                                            @NonNull final String action) {
+        final SavedQueue savedQueue = LastQueueStore.load(this);
         final PlayQueue playQueue = player.getPlayQueue();
-        if (playQueue == null || playQueue.isEmpty()) {
-            startPodcastWidgetPlaybackFromStore(intent, action);
+        final boolean controlLivePlayer = playQueue != null && !playQueue.isEmpty()
+                && (savedQueue == null || LastQueueStore.matchesQueue(savedQueue, playQueue));
+        if (!controlLivePlayer) {
+            startPodcastWidgetPlaybackFromStore(intent, action, savedQueue);
             return;
         }
 
@@ -223,8 +228,12 @@ public final class PlayerService extends MediaBrowserServiceCompat {
                 player.playPrevious();
                 break;
             case PodcastWidgetContract.ACTION_PLAY_INDEX:
-                playPodcastWidgetIndex(playQueue,
-                        intent.getIntExtra(PodcastWidgetContract.EXTRA_WIDGET_INDEX, -1));
+                final int index = intent.getIntExtra(
+                        PodcastWidgetContract.EXTRA_WIDGET_INDEX, -1);
+                if (index >= 0 && index < playQueue.size()) {
+                    player.selectQueueItem(playQueue.getStreams().get(index));
+                    player.play(); // a tap on an episode means "play this", even when paused
+                }
                 break;
             default:
                 Log.w(TAG, "handlePodcastWidgetAction() got unknown action: " + action);
@@ -233,50 +242,16 @@ public final class PlayerService extends MediaBrowserServiceCompat {
     }
 
     /**
-     * Selects a widget-tapped queue index in the running player when the widget still shows this
-     * very queue, and resumes the stored queue at that index otherwise.
+     * Resumes the last recorded queue as background audio playback for a widget action that does
+     * not target the live queue. Stops the service when nothing was recorded.
      *
-     * @param playQueue the player's current queue
-     * @param index     the queue index the widget asked to play
-     */
-    private void playPodcastWidgetIndex(@NonNull final PlayQueue playQueue, final int index) {
-        final SavedQueue savedQueue = LastQueueStore.load(this);
-        if (savedQueue != null && widgetIndexMatchesQueue(playQueue, savedQueue, index)) {
-            player.selectQueueItem(playQueue.getStreams().get(index));
-            player.play(); // a tap on an episode means "play this", even when paused
-        } else if (savedQueue != null) {
-            startPodcastWidgetPlayback(savedQueue, index);
-        }
-        // else: nothing was ever recorded, so there is nothing to play; ignore the tap.
-    }
-
-    /**
-     * @param playQueue  the player's current queue
-     * @param savedQueue the widget's stored queue
-     * @param index      the queue index the widget asked to play
-     * @return whether the stored queue still matches the player's queue at the given index, i.e.
-     * both have the same size and the same stream URL at that index
-     */
-    private static boolean widgetIndexMatchesQueue(@NonNull final PlayQueue playQueue,
-                                                   @NonNull final SavedQueue savedQueue,
-                                                   final int index) {
-        return index >= 0
-                && index < playQueue.size()
-                && playQueue.size() == savedQueue.getItems().size()
-                && playQueue.getStreams().get(index).getUrl()
-                        .equals(savedQueue.getItems().get(index).getUrl());
-    }
-
-    /**
-     * Resumes the last recorded queue as background audio playback for a widget action received
-     * while the player has no play queue (yet). Stops the service when nothing was recorded.
-     *
-     * @param intent the widget intent, carrying the widget action and possibly a queue index
-     * @param action the widget action (one of the {@code ACTION_*} contract constants)
+     * @param intent     the widget intent, carrying the widget action and possibly a queue index
+     * @param action     the widget action (one of the {@code ACTION_*} contract constants)
+     * @param savedQueue the stored queue loaded by the caller, or null when nothing is stored
      */
     private void startPodcastWidgetPlaybackFromStore(@NonNull final Intent intent,
-                                                     @NonNull final String action) {
-        final SavedQueue savedQueue = LastQueueStore.load(this);
+                                                     @NonNull final String action,
+                                                     @Nullable final SavedQueue savedQueue) {
         if (savedQueue == null) {
             destroyPlayerAndStopService();
             return;

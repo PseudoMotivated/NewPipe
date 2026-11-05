@@ -68,6 +68,12 @@ configure<ApplicationExtension> {
                 keyAlias = providers.gradleProperty("podcastKeyAlias").get()
                 keyPassword = providers.gradleProperty("podcastKeyPassword").get()
             }
+        } else if (gradle.startParameter.taskNames.any { it.contains("Release", ignoreCase = true) }) {
+            // Never ship an unsigned/differently signed release: it could not update in place.
+            throw GradleException(
+                "Set podcastStoreFile/podcastStorePassword/podcastKeyAlias/podcastKeyPassword " +
+                    "in ~/.gradle/gradle.properties (see PODCAST_FORK.md)"
+            )
         }
     }
 
@@ -169,19 +175,6 @@ checkstyle {
     isIgnoreFailures = false
     isShowViolations = true
     toolVersion = libs.versions.checkstyle.get()
-}
-
-// Podcast fork: never ship an unsigned/differently signed release, it could not update in place.
-val hasPodcastSigning = providers.gradleProperty("podcastStoreFile").isPresent
-tasks.matching { it.name == "packageRelease" }.configureEach {
-    doFirst {
-        if (!hasPodcastSigning) {
-            throw GradleException(
-                "Set podcastStoreFile/podcastStorePassword/podcastKeyAlias/podcastKeyPassword " +
-                    "in ~/.gradle/gradle.properties (see PODCAST_FORK.md)"
-            )
-        }
-    }
 }
 
 tasks.register<Checkstyle>("runCheckstyle") {

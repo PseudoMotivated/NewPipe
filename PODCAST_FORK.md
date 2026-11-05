@@ -8,6 +8,12 @@ NewPipe plus a home-screen bar widget that turns your last playlist into a podca
 - Make the widget taller to see the episodes around the current one. Tap one to play it.
 - NewPipe's "resume playback" setting continues each episode where you stopped.
 
+## Limits
+
+- The widget keeps only the playlist items NewPipe had already loaded. For a long YouTube
+  playlist, that's the pages you scrolled or played through. Open the playlist again to load more.
+- After you force-stop the app in Android settings, widget buttons do nothing until you open it once.
+
 ## Install and keep your data
 
 App ID `org.schabi.newpipe.podcast`. It sits next to stock NewPipe. Stock NewPipe is signed

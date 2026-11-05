@@ -20,8 +20,6 @@ import android.util.Log
 import android.view.View
 import android.widget.RemoteViews
 import java.util.concurrent.Executors
-import java.util.concurrent.TimeUnit
-import java.util.concurrent.TimeoutException
 import org.schabi.newpipe.MainActivity
 import org.schabi.newpipe.R
 import org.schabi.newpipe.player.PlayerService
@@ -36,20 +34,7 @@ class PodcastWidgetProvider : AppWidgetProvider() {
 
     override fun onUpdate(context: Context, appWidgetManager: AppWidgetManager, appWidgetIds: IntArray) {
         val pendingResult = goAsyncSafely()
-        try {
-            updateStaticAndRefreshThumbnail(
-                context.applicationContext,
-                appWidgetManager,
-                appWidgetIds,
-                waitForThumbnail = true
-            )
-        } catch (e: Exception) {
-            if (MainActivity.DEBUG) {
-                Log.d(TAG, "onUpdate failed", e)
-            }
-        } finally {
-            finishPendingResultSafely(pendingResult)
-        }
+        postRender(context, pendingResult, appWidgetIds.copyOf())
     }
 
     override fun onAppWidgetOptionsChanged(
@@ -59,20 +44,7 @@ class PodcastWidgetProvider : AppWidgetProvider() {
         newOptions: Bundle
     ) {
         val pendingResult = goAsyncSafely()
-        try {
-            updateStaticAndRefreshThumbnail(
-                context.applicationContext,
-                appWidgetManager,
-                intArrayOf(appWidgetId),
-                waitForThumbnail = true
-            )
-        } catch (e: Exception) {
-            if (MainActivity.DEBUG) {
-                Log.d(TAG, "onAppWidgetOptionsChanged failed", e)
-            }
-        } finally {
-            finishPendingResultSafely(pendingResult)
-        }
+        postRender(context, pendingResult, intArrayOf(appWidgetId))
     }
 
     private fun goAsyncSafely(): BroadcastReceiver.PendingResult? {
@@ -83,19 +55,6 @@ class PodcastWidgetProvider : AppWidgetProvider() {
                 Log.d(TAG, "goAsync failed", e)
             }
             null
-        }
-    }
-
-    private fun finishPendingResultSafely(pendingResult: BroadcastReceiver.PendingResult?) {
-        if (pendingResult == null) {
-            return
-        }
-        try {
-            pendingResult.finish()
-        } catch (e: RuntimeException) {
-            if (MainActivity.DEBUG) {
-                Log.d(TAG, "PendingResult.finish failed", e)
-            }
         }
     }
 
@@ -113,47 +72,105 @@ class PodcastWidgetProvider : AppWidgetProvider() {
          */
         private const val MAX_THUMBNAIL_SIZE_PX = 256
 
-        /**
-         * Broadcast callbacks wait at most this long for the thumbnail, so a slow network can
-         * never trigger a broadcast ANR; the load keeps running in the background and still
-         * applies when it finishes.
-         */
-        private const val THUMBNAIL_BROADCAST_WAIT_SECONDS = 8L
-
         private const val OPEN_APP_REQUEST_CODE = 0x706F6431
         private const val PLAY_INDEX_TEMPLATE_REQUEST_CODE = 0x706F6432
 
-        private val thumbnailExecutor = Executors.newSingleThreadExecutor()
+        private val thumbnailExecutor = Executors.newSingleThreadExecutor { runnable ->
+            Thread(runnable, "podcast-widget-thumbnail").apply { isDaemon = true }
+        }
+
+        private val thumbnailLock = Any()
+
+        @Volatile
+        private var cachedThumbnailUrl: String? = null
+
+        @Volatile
+        private var cachedThumbnail: Bitmap? = null
+
+        @Volatile
+        private var thumbnailLoadingUrl: String? = null
 
         /**
-         * Re-renders every placed widget instance. Cheap and never throws; the player calls this
-         * on queue and playback-state changes.
+         * Re-renders every placed widget instance. Returns immediately on the caller thread;
+         * the whole render (store load, RemoteViews build and widget update) is posted to
+         * [LastQueueStore.runOnIo]. Never throws.
          */
         @JvmStatic
         fun requestUpdate(context: Context) {
-            try {
-                val appContext = context.applicationContext
-                val manager = AppWidgetManager.getInstance(appContext)
-                val ids = manager.getAppWidgetIds(
-                    ComponentName(appContext, PodcastWidgetProvider::class.java)
-                )
-                if (ids.isEmpty()) {
-                    return
-                }
-                updateStaticAndRefreshThumbnail(appContext, manager, ids, waitForThumbnail = false)
+            postRender(context, null, null)
+        }
+
+        private fun postRender(
+            context: Context,
+            pendingResult: BroadcastReceiver.PendingResult?,
+            appWidgetIds: IntArray?
+        ) {
+            val appContext = try {
+                context.applicationContext ?: context
             } catch (e: Exception) {
                 if (MainActivity.DEBUG) {
                     Log.d(TAG, "requestUpdate failed", e)
                 }
+                finishPendingResultSafely(pendingResult)
+                return
+            }
+            try {
+                LastQueueStore.runOnIo(
+                    Runnable {
+                        try {
+                            renderAll(appContext, appWidgetIds)
+                        } catch (e: Exception) {
+                            if (MainActivity.DEBUG) {
+                                Log.d(TAG, "render failed", e)
+                            }
+                        } finally {
+                            finishPendingResultSafely(pendingResult)
+                        }
+                    }
+                )
+            } catch (e: Exception) {
+                if (MainActivity.DEBUG) {
+                    Log.d(TAG, "requestUpdate failed", e)
+                }
+                finishPendingResultSafely(pendingResult)
             }
         }
 
-        private fun updateStaticAndRefreshThumbnail(
-            context: Context,
-            manager: AppWidgetManager,
-            appWidgetIds: IntArray,
-            waitForThumbnail: Boolean
-        ) {
+        private fun finishPendingResultSafely(pendingResult: BroadcastReceiver.PendingResult?) {
+            if (pendingResult == null) {
+                return
+            }
+            try {
+                pendingResult.finish()
+            } catch (e: RuntimeException) {
+                if (MainActivity.DEBUG) {
+                    Log.d(TAG, "PendingResult.finish failed", e)
+                }
+            }
+        }
+
+        private fun renderAll(context: Context, requestedIds: IntArray?) {
+            val manager = try {
+                AppWidgetManager.getInstance(context)
+            } catch (e: Exception) {
+                if (MainActivity.DEBUG) {
+                    Log.d(TAG, "getInstance failed", e)
+                }
+                return
+            }
+            val appWidgetIds = requestedIds ?: try {
+                manager.getAppWidgetIds(
+                    ComponentName(context, PodcastWidgetProvider::class.java)
+                )
+            } catch (e: Exception) {
+                if (MainActivity.DEBUG) {
+                    Log.d(TAG, "getAppWidgetIds failed", e)
+                }
+                return
+            }
+            if (appWidgetIds.isEmpty()) {
+                return
+            }
             try {
                 manager.notifyAppWidgetViewDataChanged(appWidgetIds, R.id.podcast_widget_list)
             } catch (e: Exception) {
@@ -161,7 +178,6 @@ class PodcastWidgetProvider : AppWidgetProvider() {
                     Log.d(TAG, "notifyAppWidgetViewDataChanged failed", e)
                 }
             }
-
             val queue = try {
                 LastQueueStore.load(context)
             } catch (e: Exception) {
@@ -178,11 +194,26 @@ class PodcastWidgetProvider : AppWidgetProvider() {
                 }
                 false
             }
+            val items = queue?.items.orEmpty()
+            val currentThumbnailUrl = if (items.isEmpty()) {
+                null
+            } else {
+                val index = queue!!.index.coerceIn(items.indices)
+                items[index].thumbnailUrl?.takeIf { it.isNotEmpty() }
+            }
+            val thumbnail = cachedThumbnailFor(currentThumbnailUrl)
             for (appWidgetId in appWidgetIds) {
                 try {
                     manager.updateAppWidget(
                         appWidgetId,
-                        buildViews(context, appWidgetId, queue, playing, isTall(manager, appWidgetId), null)
+                        buildViews(
+                            context,
+                            appWidgetId,
+                            queue,
+                            playing,
+                            isTall(manager, appWidgetId),
+                            thumbnail
+                        )
                     )
                 } catch (e: Exception) {
                     if (MainActivity.DEBUG) {
@@ -190,80 +221,91 @@ class PodcastWidgetProvider : AppWidgetProvider() {
                     }
                 }
             }
+            if (currentThumbnailUrl != null && thumbnail == null) {
+                enqueueThumbnailLoad(context, currentThumbnailUrl)
+            }
+        }
 
-            val items = queue?.items.orEmpty()
-            val expectedThumbnailUrl = items.getOrNull(queue?.index ?: -1)?.thumbnailUrl
-            if (expectedThumbnailUrl.isNullOrEmpty()) {
+        private fun cachedThumbnailFor(url: String?): Bitmap? {
+            if (url == null) {
+                return null
+            }
+            return synchronized(thumbnailLock) {
+                if (cachedThumbnailUrl == url) cachedThumbnail else null
+            }
+        }
+
+        private fun enqueueThumbnailLoad(context: Context, url: String) {
+            synchronized(thumbnailLock) {
+                if (cachedThumbnailUrl == url && cachedThumbnail != null) {
+                    return
+                }
+                if (thumbnailLoadingUrl == url) {
+                    return
+                }
+                thumbnailLoadingUrl = url
+            }
+            val appContext = try {
+                context.applicationContext ?: context
+            } catch (e: Exception) {
+                synchronized(thumbnailLock) {
+                    if (thumbnailLoadingUrl == url) {
+                        thumbnailLoadingUrl = null
+                    }
+                }
+                if (MainActivity.DEBUG) {
+                    Log.d(TAG, "thumbnail submit failed", e)
+                }
                 return
             }
-            val task = Runnable {
-                try {
-                    loadAndApplyThumbnail(context, manager, appWidgetIds, expectedThumbnailUrl)
-                } catch (e: Exception) {
-                    if (MainActivity.DEBUG) {
-                        Log.d(TAG, "thumbnail refresh failed", e)
-                    }
-                }
-            }
             try {
-                if (waitForThumbnail) {
-                    val future = thumbnailExecutor.submit(task)
-                    try {
-                        future.get(THUMBNAIL_BROADCAST_WAIT_SECONDS, TimeUnit.SECONDS)
-                    } catch (e: TimeoutException) {
+                thumbnailExecutor.execute {
+                    val loaded = try {
+                        loadThumbnailBitmap(appContext, url)
+                    } catch (e: Exception) {
                         if (MainActivity.DEBUG) {
-                            Log.d(TAG, "thumbnail load timed out, continuing in background", e)
+                            Log.d(TAG, "thumbnail load failed", e)
+                        }
+                        null
+                    }
+                    synchronized(thumbnailLock) {
+                        if (loaded != null) {
+                            cachedThumbnailUrl = url
+                            cachedThumbnail = loaded
+                        }
+                        if (thumbnailLoadingUrl == url) {
+                            thumbnailLoadingUrl = null
                         }
                     }
-                } else {
-                    thumbnailExecutor.execute(task)
+                    if (loaded != null && isCurrentThumbnailUrl(appContext, url)) {
+                        requestUpdate(appContext)
+                    }
                 }
             } catch (e: Exception) {
+                synchronized(thumbnailLock) {
+                    if (thumbnailLoadingUrl == url) {
+                        thumbnailLoadingUrl = null
+                    }
+                }
                 if (MainActivity.DEBUG) {
                     Log.d(TAG, "thumbnail submit failed", e)
                 }
             }
         }
 
-        private fun loadAndApplyThumbnail(
-            context: Context,
-            manager: AppWidgetManager,
-            appWidgetIds: IntArray,
-            expectedThumbnailUrl: String
-        ) {
-            val bitmap = loadThumbnailBitmap(context, expectedThumbnailUrl) ?: return
-            // Skip stale results: when the queue moved on, a newer update supersedes this one.
-            val queue = try {
-                LastQueueStore.load(context)
+        private fun isCurrentThumbnailUrl(context: Context, url: String): Boolean {
+            return try {
+                val queue = LastQueueStore.load(context) ?: return false
+                if (queue.items.isEmpty()) {
+                    return false
+                }
+                val index = queue.index.coerceIn(queue.items.indices)
+                queue.items[index].thumbnailUrl == url
             } catch (e: Exception) {
                 if (MainActivity.DEBUG) {
                     Log.d(TAG, "LastQueueStore.load failed", e)
                 }
-                null
-            }
-            val items = queue?.items.orEmpty()
-            if (items.getOrNull(queue?.index ?: -1)?.thumbnailUrl != expectedThumbnailUrl) {
-                return
-            }
-            val playing = try {
-                LastQueueStore.isPlaying(context)
-            } catch (e: Exception) {
-                if (MainActivity.DEBUG) {
-                    Log.d(TAG, "LastQueueStore.isPlaying failed", e)
-                }
                 false
-            }
-            for (appWidgetId in appWidgetIds) {
-                try {
-                    manager.updateAppWidget(
-                        appWidgetId,
-                        buildViews(context, appWidgetId, queue, playing, isTall(manager, appWidgetId), bitmap)
-                    )
-                } catch (e: Exception) {
-                    if (MainActivity.DEBUG) {
-                        Log.d(TAG, "updateAppWidget failed for id $appWidgetId", e)
-                    }
-                }
             }
         }
 

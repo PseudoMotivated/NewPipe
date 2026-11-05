@@ -1248,6 +1248,7 @@ public final class Player implements PlaybackListener, Listener {
         if (playQueue.getIndex() < playQueue.size() - 1) {
             playQueue.offsetIndex(+1);
         }
+        syncPodcastWidgetQueue();
         if (isProgressLoopRunning()) {
             stopProgressLoop();
         }

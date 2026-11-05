@@ -69,10 +69,13 @@ private class PodcastWidgetListFactory(
         return (windowEnd - windowStart + 1).coerceAtLeast(0)
     }
 
-    override fun getViewAt(position: Int): RemoteViews? {
+    override fun getViewAt(position: Int): RemoteViews {
         try {
+            if (position < 0 || items.isEmpty() || position >= getCount()) {
+                return blankRow()
+            }
             val absoluteIndex = windowStart + position
-            val item = items.getOrNull(absoluteIndex) ?: return null
+            val item = items.getOrNull(absoluteIndex) ?: return blankRow()
             val views = RemoteViews(context.packageName, R.layout.podcast_widget_list_item)
             views.setTextViewText(R.id.podcast_widget_item_title, item.title)
             val duration = if (item.duration > 0) {
@@ -96,7 +99,26 @@ private class PodcastWidgetListFactory(
             if (MainActivity.DEBUG) {
                 Log.d(TAG, "getViewAt failed for position $position", e)
             }
-            return null
+            return blankRow()
+        }
+    }
+
+    private fun blankRow(): RemoteViews {
+        return try {
+            val views = RemoteViews(context.packageName, R.layout.podcast_widget_list_item)
+            views.setTextViewText(R.id.podcast_widget_item_title, "")
+            views.setTextViewText(R.id.podcast_widget_item_duration, "")
+            views.setInt(
+                R.id.podcast_widget_item_root,
+                "setBackgroundColor",
+                OTHER_ITEM_BACKGROUND
+            )
+            views
+        } catch (e: Exception) {
+            if (MainActivity.DEBUG) {
+                Log.d(TAG, "blankRow failed", e)
+            }
+            RemoteViews(context.packageName, R.layout.podcast_widget_list_item)
         }
     }
 

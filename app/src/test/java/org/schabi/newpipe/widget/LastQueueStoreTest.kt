@@ -6,6 +6,7 @@
 package org.schabi.newpipe.widget
 
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -108,6 +109,102 @@ class LastQueueStoreTest {
             ),
             decoded
         )
+    }
+
+    @Test fun `decode fills in defaults for missing fields`() {
+        val decoded = LastQueueStore.decode("""{"items":[{"url":"u"}]}""")
+
+        assertEquals(
+            SavedQueue(items = listOf(SavedQueueItem(url = "u"))),
+            decoded
+        )
+        val item = decoded!!.items[0]
+        assertEquals(0, item.serviceId)
+        assertEquals("", item.title)
+        assertEquals("", item.uploader)
+        assertNull(item.uploaderUrl)
+        assertEquals(-1L, item.duration)
+        assertNull(item.thumbnailUrl)
+        assertEquals(StreamType.VIDEO_STREAM.name, item.streamType)
+        assertEquals(0, decoded.index)
+        assertEquals(0L, decoded.savedAtMillis)
+    }
+
+    @Test fun `matchesQueue is true for same service ids and urls in order`() {
+        val saved = SavedQueue(
+            items = listOf(
+                savedItem(serviceId = 1, url = "https://example.com/a"),
+                savedItem(serviceId = 2, url = "https://example.com/b")
+            ),
+            index = 0,
+            savedAtMillis = 0L
+        )
+        val queue = SinglePlayQueue(
+            listOf(
+                streamItem(serviceId = 1, url = "https://example.com/a"),
+                streamItem(serviceId = 2, url = "https://example.com/b")
+            ),
+            0
+        )
+
+        assertTrue(LastQueueStore.matchesQueue(saved, queue))
+    }
+
+    @Test fun `matchesQueue is false for different size`() {
+        val saved = SavedQueue(
+            items = listOf(
+                savedItem(serviceId = 1, url = "https://example.com/a"),
+                savedItem(serviceId = 2, url = "https://example.com/b")
+            ),
+            index = 0,
+            savedAtMillis = 0L
+        )
+        val queue = SinglePlayQueue(
+            listOf(streamItem(serviceId = 1, url = "https://example.com/a")),
+            0
+        )
+
+        assertFalse(LastQueueStore.matchesQueue(saved, queue))
+    }
+
+    @Test fun `matchesQueue is false for different url order`() {
+        val saved = SavedQueue(
+            items = listOf(
+                savedItem(serviceId = 1, url = "https://example.com/a"),
+                savedItem(serviceId = 1, url = "https://example.com/b")
+            ),
+            index = 0,
+            savedAtMillis = 0L
+        )
+        val queue = SinglePlayQueue(
+            listOf(
+                streamItem(serviceId = 1, url = "https://example.com/b"),
+                streamItem(serviceId = 1, url = "https://example.com/a")
+            ),
+            0
+        )
+
+        assertFalse(LastQueueStore.matchesQueue(saved, queue))
+    }
+
+    @Test fun `matchesQueue is false for different serviceId`() {
+        val saved = SavedQueue(
+            items = listOf(
+                savedItem(serviceId = 1, url = "https://example.com/a"),
+                savedItem(serviceId = 2, url = "https://example.com/b")
+            ),
+            index = 0,
+            savedAtMillis = 0L
+        )
+        val queue = SinglePlayQueue(
+            listOf(
+                streamItem(serviceId = 1, url = "https://example.com/a"),
+                streamItem(serviceId = 99, url = "https://example.com/b")
+            ),
+            0
+        )
+
+        assertFalse(LastQueueStore.matchesQueue(saved, queue))
     }
 
     @Test fun `fromPlayQueueItems maps fields`() {

@@ -8,6 +8,7 @@ package org.schabi.newpipe.widget
 import android.content.Context
 import android.util.Log
 import java.io.File
+import java.util.concurrent.Executors
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
 import org.schabi.newpipe.extractor.Image
@@ -29,23 +30,48 @@ object LastQueueStore {
     private const val TAG = "LastQueueStore"
     private const val QUEUE_FILE_NAME = "podcast_widget_queue.json"
     private const val TEMP_FILE_SUFFIX = ".tmp"
-    private const val PREFS_NAME = "podcast_widget"
-    private const val KEY_PLAYING = "playing"
 
     private val json = Json { ignoreUnknownKeys = true }
 
     private val lock = Any()
 
-    // In-memory cache of the last successful write, so repeated saves of an unchanged queue
-    // (e.g. on every playback event) skip disk I/O entirely.
-    @Volatile private var lastWrittenQueue: SavedQueue? = null
+    // Single shared daemon thread for all widget disk work. Tasks run serially in posting
+    // order, so a render posted after a save observes the saved data.
+    private val ioExecutor = Executors.newSingleThreadExecutor { runnable ->
+        Thread(runnable, "podcast-widget-io").apply { isDaemon = true }
+    }
+
+    // In-memory cache of the stored queue, set by save and by the first successful file read.
+    @Volatile private var cachedQueue: SavedQueue? = null
 
     @Volatile private var lastWrittenContent: String? = null
 
+    // In-memory only: a dead process or reboot naturally reports "paused".
+    @Volatile private var playing = false
+
+    /**
+     * Runs [task] on the shared single-thread background executor. Exceptions are logged and
+     * never propagated, neither to the caller nor to the executor thread.
+     */
+    @JvmStatic
+    fun runOnIo(task: Runnable) {
+        try {
+            ioExecutor.execute {
+                try {
+                    task.run()
+                } catch (t: Throwable) {
+                    logError("Background task failed", t)
+                }
+            }
+        } catch (t: Throwable) {
+            logError("Failed to post background task", t)
+        }
+    }
+
     /**
      * Records [queue] as the last multi-item queue. No-op when the queue holds fewer than
-     * [PodcastWidgetContract.MIN_QUEUE_SIZE] items. Cheap enough to call on the main thread:
-     * unchanged queues skip the write via the in-memory cache.
+     * [PodcastWidgetContract.MIN_QUEUE_SIZE] items. On the caller thread this only snapshots
+     * the queue; conversion, encoding and the disk write run on [runOnIo]. Never throws.
      */
     @JvmStatic
     fun save(context: Context, queue: PlayQueue) {
@@ -53,27 +79,33 @@ object LastQueueStore {
             if (queue.size() < PodcastWidgetContract.MIN_QUEUE_SIZE) {
                 return
             }
-            val fresh = fromPlayQueueItems(
-                queue.getStreams(),
-                queue.getIndex(),
-                System.currentTimeMillis()
-            )
-            // Reuse the cached copy when nothing changed so the encoded content (including the
-            // timestamp) stays stable and the comparison below can skip the write.
-            val cached = lastWrittenQueue
-            val saved = if (cached != null && cached.items == fresh.items && cached.index == fresh.index) {
-                cached
-            } else {
-                fresh
-            }
-            val content = encode(saved)
-            synchronized(lock) {
-                if (content == lastWrittenContent) {
-                    return
+            val snapshot = ArrayList(queue.getStreams())
+            val index = queue.getIndex()
+            val appContext = context.applicationContext ?: context
+            runOnIo {
+                val fresh = fromPlayQueueItems(
+                    snapshot,
+                    index,
+                    System.currentTimeMillis()
+                )
+                // Reuse the cached copy when nothing changed so the encoded content (including
+                // the timestamp) stays stable and the comparison below can skip the write.
+                val cached = cachedQueue
+                val saved = if (cached != null && cached.items == fresh.items &&
+                    cached.index == fresh.index
+                ) {
+                    cached
+                } else {
+                    fresh
                 }
-                if (writeAtomically(queueFile(context), content)) {
-                    lastWrittenQueue = saved
-                    lastWrittenContent = content
+                val content = encode(saved)
+                synchronized(lock) {
+                    if (content == lastWrittenContent) {
+                        cachedQueue = saved
+                    } else if (writeAtomically(queueFile(appContext), content)) {
+                        cachedQueue = saved
+                        lastWrittenContent = content
+                    }
                 }
             }
         } catch (t: Throwable) {
@@ -83,20 +115,26 @@ object LastQueueStore {
 
     /**
      * @return the stored queue with its index clamped into range, or null when nothing usable
-     * is stored (missing, unreadable, corrupt or empty).
+     * is stored (missing, unreadable, corrupt or empty). Returns the in-memory cache when
+     * present; otherwise reads and decodes the file once and caches the result. May be called
+     * from any thread.
      */
     @JvmStatic
     fun load(context: Context): SavedQueue? {
+        cachedQueue?.let { return it }
         return try {
-            val file = queueFile(context)
-            if (!file.isFile) {
-                return null
+            synchronized(lock) {
+                cachedQueue?.let { return it }
+                val file = queueFile(context)
+                if (!file.isFile) {
+                    return null
+                }
+                val saved = decode(file.readText()) ?: return null
+                val clamped = saved.copy(index = saved.index.coerceIn(0, saved.items.size - 1))
+                cachedQueue = clamped
+                lastWrittenContent = encode(clamped)
+                clamped
             }
-            val saved = decode(file.readText()) ?: return null
-            if (saved.items.isEmpty()) {
-                return null
-            }
-            saved.copy(index = saved.index.coerceIn(0, saved.items.size - 1))
         } catch (t: Throwable) {
             logError("Failed to load queue", t)
             null
@@ -104,27 +142,21 @@ object LastQueueStore {
     }
 
     /**
-     * Updates only the index of the stored queue, leaving items and timestamp untouched.
-     * No-op when no queue is stored.
+     * @return true iff [saved] and [queue] hold the same number of items and, in order, every
+     * item has the same service id and URL.
      */
     @JvmStatic
-    fun saveIndex(context: Context, index: Int) {
-        try {
-            val stored = load(context) ?: return
-            val clamped = index.coerceIn(0, stored.items.size - 1)
-            if (clamped == stored.index) {
-                return
-            }
-            val updated = stored.copy(index = clamped)
-            val content = encode(updated)
-            synchronized(lock) {
-                if (writeAtomically(queueFile(context), content)) {
-                    lastWrittenQueue = updated
-                    lastWrittenContent = content
-                }
-            }
-        } catch (t: Throwable) {
-            logError("Failed to save queue index", t)
+    fun matchesQueue(saved: SavedQueue, queue: PlayQueue): Boolean {
+        if (saved.items.size != queue.size()) {
+            return false
+        }
+        val streams = queue.getStreams()
+        if (saved.items.size != streams.size) {
+            return false
+        }
+        return saved.items.indices.all { i ->
+            saved.items[i].serviceId == streams[i].serviceId &&
+                saved.items[i].url == streams[i].url
         }
     }
 
@@ -164,32 +196,17 @@ object LastQueueStore {
 
     @JvmStatic
     fun setPlaying(context: Context, playing: Boolean) {
-        try {
-            context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
-                .edit()
-                .putBoolean(KEY_PLAYING, playing)
-                .apply()
-        } catch (t: Throwable) {
-            logError("Failed to save playing state", t)
-        }
+        this.playing = playing
     }
 
     @JvmStatic
-    fun isPlaying(context: Context): Boolean {
-        return try {
-            context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
-                .getBoolean(KEY_PLAYING, false)
-        } catch (t: Throwable) {
-            logError("Failed to load playing state", t)
-            false
-        }
-    }
+    fun isPlaying(context: Context): Boolean = playing
 
     internal fun encode(saved: SavedQueue): String = json.encodeToString(saved)
 
     internal fun decode(content: String): SavedQueue? {
         return try {
-            json.decodeFromString<SavedQueue>(content)
+            json.decodeFromString<SavedQueue>(content).takeIf { it.items.isNotEmpty() }
         } catch (_: Exception) {
             null
         }
