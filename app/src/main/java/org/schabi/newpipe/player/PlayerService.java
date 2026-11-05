@@ -41,7 +41,12 @@ import org.schabi.newpipe.player.mediabrowser.MediaBrowserPlaybackPreparer;
 import org.schabi.newpipe.player.mediasession.MediaSessionPlayerUi;
 import org.schabi.newpipe.player.notification.NotificationPlayerUi;
 import org.schabi.newpipe.player.notification.NotificationUtil;
+import org.schabi.newpipe.player.playqueue.PlayQueue;
+import org.schabi.newpipe.util.NavigationHelper;
 import org.schabi.newpipe.util.ThemeHelper;
+import org.schabi.newpipe.widget.LastQueueStore;
+import org.schabi.newpipe.widget.PodcastWidgetContract;
+import org.schabi.newpipe.widget.SavedQueue;
 
 import java.lang.ref.WeakReference;
 import java.util.List;
@@ -170,6 +175,16 @@ public final class PlayerService extends MediaBrowserServiceCompat {
             return START_NOT_STICKY;
         }
 
+        final String widgetAction =
+                intent.getStringExtra(PodcastWidgetContract.EXTRA_WIDGET_ACTION);
+        if (widgetAction != null) {
+            // Home-screen podcast widget controls arrive as foreground-service starts (see
+            // PodcastWidgetContract), so the player exists and the service is in the foreground
+            // by now. Handle them here instead of the normal intent handling below.
+            handlePodcastWidgetAction(intent, widgetAction);
+            return START_NOT_STICKY;
+        }
+
         final PlayerType oldPlayerType = player.getPlayerType();
         player.handleIntent(intent);
         player.handleIntentPost(oldPlayerType);
@@ -178,6 +193,135 @@ public final class PlayerService extends MediaBrowserServiceCompat {
 
         return START_NOT_STICKY;
     }
+
+    //region Podcast widget
+    /**
+     * Handles a home-screen podcast widget control. When the player already has a play queue, the
+     * action controls it (leaving a video/popup player type alone); otherwise the last recorded
+     * queue is resumed as background audio playback. The player is always non-null here, since
+     * widget intents carry {@link #SHOULD_START_FOREGROUND_EXTRA}.
+     *
+     * @param intent the widget intent, carrying the widget action and possibly a queue index
+     * @param action the widget action (one of the {@code ACTION_*} contract constants)
+     */
+    private void handlePodcastWidgetAction(@NonNull final Intent intent,
+                                           @NonNull final String action) {
+        final PlayQueue playQueue = player.getPlayQueue();
+        if (playQueue == null || playQueue.isEmpty()) {
+            startPodcastWidgetPlaybackFromStore(intent, action);
+            return;
+        }
+
+        switch (action) {
+            case PodcastWidgetContract.ACTION_PLAY_PAUSE:
+                player.playPause();
+                break;
+            case PodcastWidgetContract.ACTION_NEXT:
+                player.playNext();
+                break;
+            case PodcastWidgetContract.ACTION_PREVIOUS:
+                player.playPrevious();
+                break;
+            case PodcastWidgetContract.ACTION_PLAY_INDEX:
+                playPodcastWidgetIndex(playQueue,
+                        intent.getIntExtra(PodcastWidgetContract.EXTRA_WIDGET_INDEX, -1));
+                break;
+            default:
+                Log.w(TAG, "handlePodcastWidgetAction() got unknown action: " + action);
+                break;
+        }
+    }
+
+    /**
+     * Selects a widget-tapped queue index in the running player when the widget still shows this
+     * very queue, and resumes the stored queue at that index otherwise.
+     *
+     * @param playQueue the player's current queue
+     * @param index     the queue index the widget asked to play
+     */
+    private void playPodcastWidgetIndex(@NonNull final PlayQueue playQueue, final int index) {
+        final SavedQueue savedQueue = LastQueueStore.load(this);
+        if (savedQueue != null && widgetIndexMatchesQueue(playQueue, savedQueue, index)) {
+            player.selectQueueItem(playQueue.getStreams().get(index));
+            player.play(); // a tap on an episode means "play this", even when paused
+        } else if (savedQueue != null) {
+            startPodcastWidgetPlayback(savedQueue, index);
+        }
+        // else: nothing was ever recorded, so there is nothing to play; ignore the tap.
+    }
+
+    /**
+     * @param playQueue  the player's current queue
+     * @param savedQueue the widget's stored queue
+     * @param index      the queue index the widget asked to play
+     * @return whether the stored queue still matches the player's queue at the given index, i.e.
+     * both have the same size and the same stream URL at that index
+     */
+    private static boolean widgetIndexMatchesQueue(@NonNull final PlayQueue playQueue,
+                                                   @NonNull final SavedQueue savedQueue,
+                                                   final int index) {
+        return index >= 0
+                && index < playQueue.size()
+                && playQueue.size() == savedQueue.getItems().size()
+                && playQueue.getStreams().get(index).getUrl()
+                        .equals(savedQueue.getItems().get(index).getUrl());
+    }
+
+    /**
+     * Resumes the last recorded queue as background audio playback for a widget action received
+     * while the player has no play queue (yet). Stops the service when nothing was recorded.
+     *
+     * @param intent the widget intent, carrying the widget action and possibly a queue index
+     * @param action the widget action (one of the {@code ACTION_*} contract constants)
+     */
+    private void startPodcastWidgetPlaybackFromStore(@NonNull final Intent intent,
+                                                     @NonNull final String action) {
+        final SavedQueue savedQueue = LastQueueStore.load(this);
+        if (savedQueue == null) {
+            destroyPlayerAndStopService();
+            return;
+        }
+
+        final int index;
+        switch (action) {
+            case PodcastWidgetContract.ACTION_PLAY_PAUSE:
+                index = savedQueue.getIndex();
+                break;
+            case PodcastWidgetContract.ACTION_NEXT:
+                index = Math.min(savedQueue.getIndex() + 1, savedQueue.getItems().size() - 1);
+                break;
+            case PodcastWidgetContract.ACTION_PREVIOUS:
+                index = Math.max(savedQueue.getIndex() - 1, 0);
+                break;
+            case PodcastWidgetContract.ACTION_PLAY_INDEX:
+                index = intent.getIntExtra(PodcastWidgetContract.EXTRA_WIDGET_INDEX,
+                        savedQueue.getIndex());
+                break;
+            default:
+                Log.w(TAG, "handlePodcastWidgetAction() got unknown action: " + action);
+                return;
+        }
+        startPodcastWidgetPlayback(savedQueue, index);
+    }
+
+    /**
+     * Starts background (audio) playback of a stored queue with resume-from-saved-position
+     * behaviour, using the same intent extras
+     * {@link NavigationHelper#playOnBackgroundPlayer} builds, but without showing a toast.
+     *
+     * @param savedQueue the recorded queue to play
+     * @param index      the queue index to start at
+     */
+    private void startPodcastWidgetPlayback(@NonNull final SavedQueue savedQueue, final int index) {
+        final PlayerType oldPlayerType = player.getPlayerType();
+        final Intent playIntent = NavigationHelper.getPlayerIntent(this, PlayerService.class,
+                        LastQueueStore.toPlayQueue(savedQueue, index), PlayerIntentType.AllOthers)
+                .putExtra(Player.PLAYER_TYPE, PlayerType.AUDIO)
+                .putExtra(Player.RESUME_PLAYBACK, true);
+        player.handleIntent(playIntent);
+        player.handleIntentPost(oldPlayerType);
+    }
+    //endregion
 
     public void stopForImmediateReusing() {
         if (DEBUG) {

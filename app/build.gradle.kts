@@ -48,12 +48,27 @@ configure<ApplicationExtension> {
             version = release(NEWPIPE_VERSION_SDK_TARGET)
         }
 
-        versionCode = System.getProperty("versionCodeOverride")?.toInt() ?: NEWPIPE_VERSION_CODE
+        // Podcast fork: upstream code * 100 + fork revision, so fork updates always increase.
+        versionCode = System.getProperty("versionCodeOverride")?.toInt()
+            ?: (NEWPIPE_VERSION_CODE * 100 + PODCAST_FORK_REVISION)
 
-        versionName = NEWPIPE_VERSION_NAME
+        versionName = "$NEWPIPE_VERSION_NAME-podcast.$PODCAST_FORK_REVISION"
         System.getProperty("versionNameSuffix")?.let { versionNameSuffix = it }
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
+    }
+
+    signingConfigs {
+        // Keystore lives outside the repo; configure it in ~/.gradle/gradle.properties.
+        val storePath = providers.gradleProperty("podcastStoreFile").orNull
+        if (storePath != null) {
+            create("podcast") {
+                storeFile = file(storePath)
+                storePassword = providers.gradleProperty("podcastStorePassword").get()
+                keyAlias = providers.gradleProperty("podcastKeyAlias").get()
+                keyPassword = providers.gradleProperty("podcastKeyPassword").get()
+            }
+        }
     }
 
     buildTypes {
@@ -71,10 +86,11 @@ configure<ApplicationExtension> {
         }
 
         release {
-            System.getProperty("packageSuffix")?.let { suffix ->
-                applicationIdSuffix = suffix
-                resValue("string", "app_name", "NewPipe $suffix")
-            }
+            // NewPipe Podcast fork: own app id so it installs next to stock NewPipe and
+            // updates in place when signed with the same local key (see PODCAST_FORK.md).
+            applicationIdSuffix = ".podcast"
+            resValue("string", "app_name", "NewPipe Podcast")
+            signingConfig = signingConfigs.findByName("podcast")
             isMinifyEnabled = true
             isShrinkResources = true
             proguardFiles(
@@ -153,6 +169,19 @@ checkstyle {
     isIgnoreFailures = false
     isShowViolations = true
     toolVersion = libs.versions.checkstyle.get()
+}
+
+// Podcast fork: never ship an unsigned/differently signed release, it could not update in place.
+val hasPodcastSigning = providers.gradleProperty("podcastStoreFile").isPresent
+tasks.matching { it.name == "packageRelease" }.configureEach {
+    doFirst {
+        if (!hasPodcastSigning) {
+            throw GradleException(
+                "Set podcastStoreFile/podcastStorePassword/podcastKeyAlias/podcastKeyPassword " +
+                    "in ~/.gradle/gradle.properties (see PODCAST_FORK.md)"
+            )
+        }
+    }
 }
 
 tasks.register<Checkstyle>("runCheckstyle") {

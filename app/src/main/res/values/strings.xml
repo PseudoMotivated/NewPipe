@@ -903,4 +903,14 @@
     <string name="api23_requirement_dialog_title">NewPipe is dropping support for Android 5</string>
     <string name="api23_requirement_dialog_message">Unfortunately NewPipe depends on a few libraries that dropped support for Android 5.0 and 5.1. The next NewPipe release will therefore only work on devices with Android 6 or higher, sadly. Read more in the blogpost.</string>
     <string name="api23_requirement_dialog_blogpost">Blogpost</string>
+    <!-- Podcast widget -->
+    <string name="podcast_widget_label">NewPipe Podcast</string>
+    <string name="podcast_widget_description">Resume your last playlist as audio from the home screen</string>
+    <string name="podcast_widget_empty">Play a playlist in NewPipe to start</string>
+    <string name="podcast_widget_position">%1$d of %2$d</string>
+    <string name="podcast_widget_play">Play</string>
+    <string name="podcast_widget_pause">Pause</string>
+    <string name="podcast_widget_previous">Previous</string>
+    <string name="podcast_widget_next">Next</string>
+    <string name="podcast_widget_open_app">Open NewPipe</string>
 </resources>

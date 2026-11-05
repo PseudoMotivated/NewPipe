@@ -126,6 +126,8 @@ import org.schabi.newpipe.util.NavigationHelper;
 import org.schabi.newpipe.util.SerializedCache;
 import org.schabi.newpipe.util.StreamTypeUtil;
 import org.schabi.newpipe.util.image.CoilHelper;
+import org.schabi.newpipe.widget.LastQueueStore;
+import org.schabi.newpipe.widget.PodcastWidgetProvider;
 
 import java.util.List;
 import java.util.Objects;
@@ -616,6 +618,7 @@ public final class Player implements PlaybackListener, Listener {
 
         simpleExoPlayer.setVolume(isMuted() ? 0 : 1);
         notifyQueueUpdateToListeners();
+        syncPodcastWidgetQueue();
     }
 
     private void initPlayer(final boolean playOnReady) {
@@ -699,6 +702,8 @@ public final class Player implements PlaybackListener, Listener {
         streamItemDisposable.clear();
 
         UIs.destroyAll(Object.class); // destroy every UI: obviously every UI extends Object
+
+        syncPodcastWidgetPlayingState(false);
     }
 
     public void setRecovery() {
@@ -1199,6 +1204,7 @@ public final class Player implements PlaybackListener, Listener {
         }
 
         UIs.call(PlayerUi::onPlaying);
+        syncPodcastWidgetPlayingState(true);
     }
 
     private void onBuffering() {
@@ -1219,6 +1225,7 @@ public final class Player implements PlaybackListener, Listener {
         }
 
         UIs.call(PlayerUi::onPaused);
+        syncPodcastWidgetPlayingState(false);
     }
 
     private void onPausedSeek() {
@@ -1244,6 +1251,7 @@ public final class Player implements PlaybackListener, Listener {
         if (isProgressLoopRunning()) {
             stopProgressLoop();
         }
+        syncPodcastWidgetPlayingState(false);
     }
     //endregion
 
@@ -1655,6 +1663,8 @@ public final class Player implements PlaybackListener, Listener {
         if (exoPlayerIsNull() || playQueue == null || currentItem == item) {
             return; // nothing to synchronize
         }
+        // The current item changed (user action, auto-transition, ...): re-record the queue.
+        syncPodcastWidgetQueue();
 
         final int playQueueIndex = playQueue.indexOf(item);
         final int playlistIndex = simpleExoPlayer.getCurrentMediaItemIndex();
@@ -1810,6 +1820,7 @@ public final class Player implements PlaybackListener, Listener {
             playQueue.offsetIndex(-1);
         }
         triggerProgressUpdate();
+        syncPodcastWidgetQueue();
     }
 
     public void playNext() {
@@ -1823,6 +1834,7 @@ public final class Player implements PlaybackListener, Listener {
         saveStreamProgressState();
         playQueue.offsetIndex(+1);
         triggerProgressUpdate();
+        syncPodcastWidgetQueue();
     }
 
     public void fastForward() {
@@ -1998,12 +2010,38 @@ public final class Player implements PlaybackListener, Listener {
             saveStreamProgressState();
         }
         playQueue.setIndex(index);
+        syncPodcastWidgetQueue();
     }
 
     @Override
     public void onPlayQueueEdited() {
         notifyPlaybackUpdateToListeners();
         UIs.call(PlayerUi::onPlayQueueEdited);
+        syncPodcastWidgetQueue();
+    }
+
+    /**
+     * Records the current play queue for the home-screen podcast widget and asks all widgets to
+     * re-render. Queues with fewer than two items are ignored by the store, and unchanged content
+     * is not rewritten, so this is cheap to call on every queue or index change (but it must not
+     * be called from the per-second progress loop).
+     */
+    private void syncPodcastWidgetQueue() {
+        if (playQueue != null) {
+            LastQueueStore.save(context, playQueue);
+        }
+        PodcastWidgetProvider.requestUpdate(context);
+    }
+
+    /**
+     * Records the playing/paused state for the home-screen podcast widget and asks all widgets to
+     * re-render.
+     *
+     * @param playing whether playback is currently playing
+     */
+    private void syncPodcastWidgetPlayingState(final boolean playing) {
+        LastQueueStore.setPlaying(context, playing);
+        PodcastWidgetProvider.requestUpdate(context);
     }
 
     @Override // own playback listener
